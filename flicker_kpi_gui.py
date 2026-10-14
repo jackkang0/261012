@@ -18,6 +18,7 @@ Flicker KPI GUI
   - Y 定義可選: BT.601 / (R+2G+B)/4 / R+2G+B
   - 每項 metric 可各自開關；停用者不列入 PASS/FAIL、風險圖、分格與最佳化
   - FAIL 判定: 任一 metric 超標位置數 >= K 即 FAIL (K=1 即「任一 pixel 超標」)
+  - Threshold 最佳化（框層級模式）: 框內要被判成閃、框外不要，輸出不同容許量的取捨曲線
   - Threshold 最佳化: 用「不閃 folder」+「混合 folder（逐組標記閃/不閃）」求一組 threshold 與 K，
                       使漏抓 = 0 且誤報最少，可一鍵套用回主視窗
   - 人工框 (ROI): 在閃序列上框出「這裡必須抓到」的位置，存成資料夾的 flicker_rois.csv；
@@ -52,7 +53,7 @@ from flicker_kpi_core import (
     metric_is_fail, k_for_level,
     default_settings_path, save_settings, load_settings,
     Y_MODES, DEFAULT_Y_MODE, all_enabled, is_enabled, LEGEND_H,
-    load_rois, save_rois, clip_box, ROI_FILE, box_metric_stats,
+    load_rois, save_rois, clip_box, ROI_FILE, box_metric_stats, roi_summary,
 )
 import flicker_kpi_opt as kopt
 
@@ -63,9 +64,11 @@ CSV_HEADER = ["sequence", "level", "metric", "threshold", "fail_ratio_%",
 SUMMARY_HEADER = ["sequence", "verdict", "pixel_fail_metrics", "block_fail_metrics",
                   "FAIL+SEVERE_area_%", "worst_level", "max_ratio", "max_metric",
                   "max_x", "max_y", "tile_size", "tiles_red", "tiles_orange",
-                  "tiles_yellow", "tiles_fail", "tile_fail_%"]
+                  "tiles_yellow", "tiles_fail", "tile_fail_%",
+                  "roi_boxes", "roi_caught", "roi_missed", "roi_outside_tiles",
+                  "roi_outside_flagged"]
 SEQ_COLS = ("sequence", "verdict", "pix_fail", "blk_fail", "danger%", "worst", "max_ratio",
-            "tiles R/O/Y")
+            "tiles R/O/Y", "框抓到", "框漏抓", "框外多抓")
 
 
 def metric_rows(result, min_fail=1, enabled=None):
@@ -84,12 +87,14 @@ def metric_rows(result, min_fail=1, enabled=None):
     return rows
 
 
-def summary_row(sm):
+def summary_row(sm, roi=None):
     return [sm["name"], sm["verdict"], sm["pixel_fail_metrics"], sm["block_fail_metrics"],
             f"{sm['danger_pct']:.4f}", sm["worst_level"], f"{sm['max_ratio']:.3f}",
             sm["max_metric"], sm["max_xy"][0], sm["max_xy"][1],
             sm["tile_size"], sm["tiles_red"], sm["tiles_orange"], sm["tiles_yellow"],
-            sm["tiles_fail"], f"{sm['tile_fail_pct']:.4f}"]
+            sm["tiles_fail"], f"{sm['tile_fail_pct']:.4f}"] + (
+        [roi["n_box"], roi["n_caught"], roi["n_box"] - roi["n_caught"],
+         roi["n_tile"], roi["n_fp"]] if roi else ["", "", "", "", ""])
 
 
 def write_csv(path, header, rows):
@@ -279,6 +284,8 @@ class FlickerKPIApp:
         self.sel_box = None
         self._drag = None
         self.draw_roi = tk.BooleanVar(value=False)
+        self.k_box_text = tk.StringVar(value="1")
+        self.k_box = 1
         self.risk_bounds_text = tk.StringVar(
             value=",".join(f"{b:g}" for b in DEFAULT_RISK_BOUNDS))
         self.risk_bounds = DEFAULT_RISK_BOUNDS
@@ -355,7 +362,7 @@ class FlickerKPIApp:
         sf.pack(fill="x")
         self.seq_tree = ttk.Treeview(sf, columns=SEQ_COLS, show="headings", height=7,
                                      selectmode="browse")
-        for c, w in zip(SEQ_COLS, (170, 55, 55, 55, 65, 60, 65, 85)):
+        for c, w in zip(SEQ_COLS, (150, 50, 50, 50, 60, 55, 60, 75, 60, 55, 70)):
             self.seq_tree.heading(c, text=c)
             self.seq_tree.column(c, width=int(w * self.S), anchor="e")
         self.seq_tree.column("sequence", anchor="w")
@@ -431,6 +438,11 @@ class FlickerKPIApp:
         ttk.Button(ctrl3, text="刪除選取框", command=self._delete_box).pack(side="left")
         ttk.Button(ctrl3, text="清除本序列", command=self._clear_boxes).pack(side="left", padx=4)
         ttk.Button(ctrl3, text="儲存框", command=self._save_rois).pack(side="left")
+        ttk.Label(ctrl3, text="框內 K:").pack(side="left", padx=(8, 2))
+        kbe = ttk.Entry(ctrl3, textvariable=self.k_box_text, width=4)
+        kbe.pack(side="left")
+        kbe.bind("<Return>", lambda e: self.apply_k_box())
+        ttk.Button(ctrl3, text="套用", command=self.apply_k_box).pack(side="left", padx=2)
 
         ttk.Label(ctrl3, text="縮放:").pack(side="left", padx=(10, 2))
         zcb = ttk.Combobox(ctrl3, textvariable=self.zoom_text, width=8, state="readonly",
@@ -556,7 +568,7 @@ class FlickerKPIApp:
         self.seq_tree.delete(*self.seq_tree.get_children())
         for i, sq in enumerate(seqs):
             self.seq_tree.insert("", "end", iid=str(i),
-                                 values=(sq["name"], "—", "", "", "", "", "", ""))
+                                 values=(sq["name"], "—", "", "", "", "", "", "", "", "", ""))
         self.path_label.config(text=folder)
         if self.rois:
             n = sum(len(v) for v in self.rois.values())
@@ -592,11 +604,19 @@ class FlickerKPIApp:
         self.status.config(text=f"[{idx+1}/{len(self.seqs)}] {sq['name']}: "
                                 f"{self.result['n_frames']} frames, {w}x{h}{extra}")
 
-    def _set_seq_row(self, idx, sm, tag):
+    def _set_seq_row(self, idx, sm, tag, roi=None):
+        box_hit = box_miss = "-"
+        fp = "-"
+        if roi is not None:
+            if roi["n_box"]:
+                box_hit = f"{roi['n_caught']}/{roi['n_box']}"
+                box_miss = str(roi["n_box"] - roi["n_caught"])
+            fp = f"{roi['n_fp']}/{roi['n_tile']}"
         self.seq_tree.item(str(idx), tags=(tag,), values=(
             sm["name"], sm["verdict"], sm["pixel_fail_metrics"], sm["block_fail_metrics"],
             f"{sm['danger_pct']:.3f}", sm["worst_level"], f"{sm['max_ratio']:.2f}",
-            f"{sm['tiles_red']}/{sm['tiles_orange']}/{sm['tiles_yellow']}"))
+            f"{sm['tiles_red']}/{sm['tiles_orange']}/{sm['tiles_yellow']}",
+            box_hit, box_miss, fp))
 
     def _update_current_row(self):
         if self.result is None or self.cur_idx is None:
@@ -604,7 +624,10 @@ class FlickerKPIApp:
         risk = compute_risk(self.result, self.risk_bounds, enabled=self.enabled)
         sm = summarize_result(self.result, risk, self._tiles_for(self.result, risk),
                               self.min_fail, self.enabled)
-        self._set_seq_row(self.cur_idx, sm, "fail" if sm["verdict"] == "FAIL" else "pass")
+        roi = roi_summary(self.result, self._cur_boxes(), self.tile_size, self.k_box,
+                          self.enabled)
+        self._set_seq_row(self.cur_idx, sm, "fail" if sm["verdict"] == "FAIL" else "pass",
+                          roi)
         self._resort_seqs()
 
     def _mark_others_stale(self):
@@ -669,6 +692,7 @@ class FlickerKPIApp:
             "thresholds": {lv: dict(self.thresholds[lv]) for lv in ("pixel", "block")},
             "enabled": {lv: dict(self.enabled[lv]) for lv in ("pixel", "block")},
             "min_fail": int(self.min_fail),
+            "k_box": int(self.k_box),
             "risk_bounds": list(self.risk_bounds),
             "tile_size": int(self.tile_size),
             "tile_rules": {k: list(v) for k, v in self.tile_rules.items()},
@@ -689,6 +713,9 @@ class FlickerKPIApp:
         if "min_fail" in st:
             self.min_fail = int(st["min_fail"])
             self.min_fail_text.set(str(self.min_fail))
+        if "k_box" in st:
+            self.k_box = int(st["k_box"])
+            self.k_box_text.set(str(self.k_box))
         if "risk_bounds" in st:
             self.risk_bounds = tuple(st["risk_bounds"])
             self.risk_bounds_text.set(",".join(f"{b:g}" for b in self.risk_bounds))
@@ -776,6 +803,21 @@ class FlickerKPIApp:
     def _refresh_box_info(self):
         if self.sel_box is not None and self.result:
             self._show_box_info(self.sel_box)
+
+    def apply_k_box(self):
+        """框／框外格的判定門檻數（框內有幾個位置超標算抓到）"""
+        try:
+            k = int(self.k_box_text.get())
+            if k < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("框內 K 錯誤", "框內 K 需為 >= 1 的整數")
+            return
+        self.k_box = k
+        if self.result:
+            self._update_current_row()
+            self._mark_others_stale()
+            self._refresh_box_info()
 
     def apply_min_fail(self):
         try:
@@ -1165,7 +1207,7 @@ class FlickerKPIApp:
 
     def _metric_table(self, box, label="範圍"):
         """某一範圍內 20 項 metric 的最大值 / 門檻 / 比值 / 超標數，依比值排序"""
-        rows = box_metric_stats(self.result, box, self.enabled, self.min_fail)
+        rows = box_metric_stats(self.result, box, self.enabled, self.k_box)
         rows.sort(key=lambda r: -r["ratio"])
         hit = [r for r in rows if r["enabled"] and r["fail"]]
         hit_txt = ("閃  (" + ", ".join(f"{r['level']}:{r['metric']}" for r in hit[:3])
@@ -1189,7 +1231,7 @@ class FlickerKPIApp:
         b = boxes[i]
         w, h = b[2] - b[0], b[3] - b[1]
         txt = [f"框 #{i+1}/{len(boxes)}   x {b[0]}~{b[2]-1}, y {b[1]}~{b[3]-1}"
-               f"   ({w}x{h} = {w*h} px)   K={self.min_fail}"]
+               f"   ({w}x{h} = {w*h} px)   框內 K={self.k_box}"]
         txt += self._metric_table(b, "框")
         self.info.delete("1.0", "end")
         self.info.insert("1.0", "\n".join(txt))
@@ -1342,9 +1384,11 @@ class FlickerKPIApp:
                 imwrite_unicode(os.path.join(out, f"{sq['name']}_tile_map.png"),
                                 render_tile_map(r, tiles)[0])
                 sm = summarize_result(r, risk, tiles, self.min_fail, self.enabled)
+                roi = roi_summary(r, self.rois.get(sq["name"], []), self.tile_size,
+                                  self.k_box, self.enabled)
                 all_rows += metric_rows(r, self.min_fail, self.enabled)
-                summ_rows.append(summary_row(sm))
-                self._set_seq_row(i, sm, "fail" if sm["verdict"] == "FAIL" else "pass")
+                summ_rows.append(summary_row(sm, roi))
+                self._set_seq_row(i, sm, "fail" if sm["verdict"] == "FAIL" else "pass", roi)
                 self._resort_seqs()
                 if i == self.cur_idx:
                     self.result = r
@@ -1353,7 +1397,8 @@ class FlickerKPIApp:
                 errors.append(f"{sq['name']}: {e}")
                 summ_rows.append([sq["name"], "ERROR"] + [""] * (len(SUMMARY_HEADER) - 2))
                 self.seq_tree.item(str(i), tags=("error",),
-                                   values=(sq["name"], "ERROR", "", "", "", "", "", ""))
+                                   values=(sq["name"], "ERROR", "", "", "", "", "", "",
+                                           "", "", ""))
 
         write_csv(os.path.join(out, "flicker_kpi_report_all.csv"), CSV_HEADER, all_rows)
         write_csv(os.path.join(out, "flicker_kpi_summary.csv"), SUMMARY_HEADER, summ_rows)
@@ -1398,6 +1443,11 @@ class ThresholdOptWindow:
         self.k_text = tk.StringVar(value=",".join(str(k) for k in kopt.DEFAULT_K_LIST))
         self.tol_text = tk.StringVar(value="0")
         self.fa_per_box_text = tk.StringVar(value="0")
+        self.roi_mode = tk.BooleanVar(value=False)
+        self.k_box_text = tk.StringVar(value=str(app.k_box))
+        self.budget_text = tk.StringVar(
+            value=",".join(str(b) for b in kopt.DEFAULT_ROI_BUDGETS))
+        self.roi_cache = {}
         self._build()
 
     # ------------------------------------------------------------------
@@ -1476,6 +1526,17 @@ class ThresholdOptWindow:
         ttk.Label(pf, text="嚴格: 門檻 = 不閃樣本最大值 x (1+容忍度)，不漏抓優先\n"
                            "平衡: 閃 / 不閃兩側邊界相等\n兩種模式都會算，結果表可直接比較",
                   foreground="#555").grid(row=2, column=0, columnspan=2, sticky="w")
+        rf = ttk.LabelFrame(right, text="框層級模式（框內要抓到、框外不要觸發）", padding=4)
+        rf.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(rf, text="一併計算框層級模式", variable=self.roi_mode).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(rf, text="框內 K（幾個位置超標算抓到）:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(rf, textvariable=self.k_box_text, width=6).grid(row=1, column=1, sticky="w")
+        ttk.Label(rf, text="容許框外誤判格數（逗號分隔）:").grid(row=2, column=0, sticky="w")
+        ttk.Entry(rf, textvariable=self.budget_text, width=16).grid(row=2, column=1, sticky="w")
+        self.roi_hint = ttk.Label(rf, text="", foreground="#555")
+        self.roi_hint.grid(row=3, column=0, columnspan=2, sticky="w")
+
         ttk.Button(pf, text="執行最佳化", command=self.run).grid(
             row=5, column=0, columnspan=2, sticky="we", pady=4)
 
@@ -1657,10 +1718,15 @@ class ThresholdOptWindow:
             k_list = sorted({int(x) for x in self.k_text.get().replace(" ", "").split(",")})
             tol = float(self.tol_text.get()) / 100
             fa_per_box = float(self.fa_per_box_text.get())
-            if not k_list or k_list[0] < 1 or tol < 0 or fa_per_box < 0:
+            k_box = int(self.k_box_text.get())
+            budgets = sorted({int(x) for x in
+                              self.budget_text.get().replace(" ", "").split(",")})
+            if (not k_list or k_list[0] < 1 or tol < 0 or fa_per_box < 0
+                    or k_box < 1 or budgets[0] < 0):
                 raise ValueError
         except ValueError:
-            messagebox.showerror("參數錯誤", "K 需為逗號分隔的正整數；容忍度為 >= 0 的數字 (%)",
+            messagebox.showerror("參數錯誤",
+                                 "K 與框內 K 需為正整數；容忍度與容許格數需 >= 0",
                                  parent=self.win)
             return
         use = [r for r in self.rows if r["label"] is not None]
@@ -1706,11 +1772,21 @@ class ThresholdOptWindow:
             return
         self.results = kopt.sweep_k(topks, labels, k_list, bs, tol=tol, active=active,
                                     box_topks=box_topks or None, fa_per_box=fa_per_box)
+        if self.roi_mode.get():
+            self.results += self._run_roi(use, active, k_box, budgets, diff_mode,
+                                          y_mode, bs)
         self.n_active = int(active.sum())
         self.used = use
         n_clean = sum(1 for l in labels if not l)
         self.rtree.delete(*self.rtree.get_children())
         for i, res in enumerate(self.results):
+            if res["mode"] == "roi":
+                self.rtree.insert("", "end", iid=str(i), values=(
+                    "框層級", res["K"], res["n_fp_tile"],
+                    f"{res['n_fp_tile']/max(res['n_neg'],1)*100:.2f}%", "-",
+                    f"{res['n_box_caught']}/{res['n_box']}", "-", "-",
+                    "精確" if res["exact"] else "近似"))
+                continue
             self.rtree.insert("", "end", iid=str(i), values=(
                 "嚴格" if res["mode"] == "strict" else "平衡",
                 res["K"], len(res["fa_idx"]), f"{len(res['fa_idx'])/n_clean*100:.1f}%",
@@ -1727,11 +1803,54 @@ class ThresholdOptWindow:
                  + f"嚴格模式最佳 K={best['K']}，誤報 {len(best['fa_idx'])}，"
                    f"漏抓 {len(best['miss_idx'])}")
 
+    @_report_errors("框層級最佳化失敗")
+    def _run_roi(self, use, active, k_box, budgets, diff_mode, y_mode, bs):
+        """
+        正樣本 = 人工框；負樣本 = 閃序列的框外格 + 不閃序列全圖的格（格大小取主視窗的分格）
+        """
+        tile = self.app.tile_size
+        if not any(r["label"] == 1 and r["boxes"] for r in use):
+            messagebox.showwarning("沒有人工框",
+                                   "框層級模式需要在閃序列上畫框", parent=self.win)
+            return []
+        Bs, Ns, self.roi_box_rows, self.roi_neg_rows = [], [], [], []
+        for i, r in enumerate(use):
+            boxes = tuple(r["boxes"]) if r["label"] == 1 else ()
+            key = (tuple(r["paths"]), diff_mode, y_mode, bs, tile, k_box, boxes)
+            if key not in self.roi_cache:
+                self.status.config(
+                    text=f"框層級統計 {i+1}/{len(use)}: {r['source']} {r['name']}")
+                self.win.update()
+                self.roi_cache[key] = kopt.sequence_roi_stats(
+                    r["paths"], list(boxes), tile, k_box, diff_mode, bs, y_mode)
+            bmat, nmat = self.roi_cache[key]
+            if r["label"] == 1 and len(bmat):
+                Bs.append(bmat)
+                self.roi_box_rows += [(r, b) for b in boxes]
+            if r["label"] == 0 or boxes:        # 不閃序列整張圖 / 閃序列的框外
+                Ns.append(nmat)
+                self.roi_neg_rows += [(r, g) for g in range(len(nmat))]
+        B = np.vstack(Bs) if Bs else np.zeros((0, len(kopt.KEYS)))
+        N = np.vstack(Ns) if Ns else np.zeros((0, len(kopt.KEYS)))
+        self.status.config(text=f"框層級最佳化中（框 {len(B)}、負樣本格 {len(N)}）...")
+        self.win.update()
+        out = kopt.optimize_roi(B, N, budgets, active)
+        for res in out:
+            res["K"] = k_box
+            res["tile"] = tile
+        self.roi_hint.config(
+            text=f"格大小 {tile}x{tile}（跟主視窗分格一致）；"
+                 f"框 {len(B)} 個、負樣本格 {len(N)} 個")
+        return out
+
     def _show_result(self):
         sel = self.rtree.selection()
         if not sel or not self.results:
             return
         res = self.results[int(sel[0])]
+        if res["mode"] == "roi":
+            self._show_roi_result(res)
+            return
         self._fill_tree(res)
         use = self.used
         cur = self.app.thresholds
@@ -1787,6 +1906,49 @@ class ThresholdOptWindow:
         self.detail.delete("1.0", "end")
         self.detail.insert("1.0", "\n".join(lines))
 
+    def _show_roi_result(self, res):
+        cur = self.app.thresholds
+        lines = [f"框層級模式   格大小 {res['tile']}x{res['tile']}   框內 K = {res['K']}   "
+                 f"解法: {'精確 (MILP)' if res['exact'] else '近似 (greedy)'}",
+                 f"容許框外誤判 {res['budget']} 格 -> 實際 {res['n_fp_tile']} 格 "
+                 f"(負樣本共 {res['n_neg']} 格)",
+                 f"框抓到 {res['n_box_caught']}/{res['n_box']} "
+                 f"({res['n_box_caught']/max(res['n_box'],1)*100:.1f}%)", ""]
+        lines.append("取捨曲線（同一次執行的其他容許量）:")
+        for r in self.results:
+            if r["mode"] == "roi":
+                mark = " <-" if r is res else ""
+                lines.append(f"   容許 {r['budget']:>4} 格 -> 框抓到 "
+                             f"{r['n_box_caught']}/{r['n_box']}"
+                             f"   實際誤判 {r['n_fp_tile']} 格{mark}")
+        lines += ["", f"{'metric':<22}{'目前':>10}{'最佳化':>12}"]
+        for j, (lv, m) in enumerate(kopt.KEYS):
+            v = res["thresholds"][j]
+            mark = " *" if j in res["lowered"] else ""
+            txt = "(停用)" if not np.isfinite(v) else f"{v:.2f}"
+            lines.append(f"{lv+':'+m:<22}{cur[lv][m]:>10.2f}{txt:>12}{mark}")
+        lines.append("  (* = 為了抓到框而下降、會造成框外誤判的項；"
+                     "其餘放在負樣本最大值上，不會誤判)")
+        miss = np.flatnonzero(~res["box_caught"])
+        if len(miss):
+            lines += ["", "沒抓到的框:"]
+            for b in miss[:30]:
+                r0, bx = self.roi_box_rows[b]
+                lines.append(f"  {r0['source']} {r0['name']}  "
+                             f"x {bx[0]}~{bx[2]-1}, y {bx[1]}~{bx[3]-1}")
+            if len(miss) > 30:
+                lines.append(f"  ...（共 {len(miss)} 個）")
+        fp = np.flatnonzero(res["fp_mask"])
+        if len(fp):
+            lines += ["", "被誤判的框外格（可回頭確認是不是漏框）:"]
+            for g in fp[:30]:
+                r0, gi = self.roi_neg_rows[g]
+                lines.append(f"  {r0['source']} {r0['name']}  第 {gi} 格")
+            if len(fp) > 30:
+                lines.append(f"  ...（共 {len(fp)} 格）")
+        self.detail.delete("1.0", "end")
+        self.detail.insert("1.0", "\n".join(lines))
+
     def _apply(self):
         sel = self.rtree.selection()
         if not sel or not self.results:
@@ -1794,8 +1956,8 @@ class ThresholdOptWindow:
             return
         res = self.results[int(sel[0])]
         self.app.set_thresholds_and_k(kopt.thresholds_to_dict(res["thresholds"]), res["K"])
-        self.status.config(text=f"已套用 {'嚴格' if res['mode'] == 'strict' else '平衡'}模式 "
-                                f"K={res['K']} 與 20 個 threshold 到主視窗")
+        name = {"strict": "嚴格", "balanced": "平衡", "roi": "框層級"}[res["mode"]]
+        self.status.config(text=f"已套用 {name}模式 K={res['K']} 與門檻到主視窗")
         self._show_result()
 
 
